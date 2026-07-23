@@ -18,7 +18,7 @@ from pathlib import Path
 import requests
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODELS_DIR = Path(__file__).resolve().parent.parent / "modelscripts"
 
 _AW_API_KEY  = os.getenv("ACCUWEATHER_API_KEY")
 _AW_BASE     = "https://dataservice.accuweather.com"
@@ -446,7 +446,7 @@ def _fetch_aw_raw():
 
 
 def _run_one_model(model, aw_shared_path=None):
-    script = PROJECT_ROOT / model["script"]
+    script = MODELS_DIR / model["script"]
     env = {**os.environ}
     if aw_shared_path:
         env["AW_SHARED_DATA"] = aw_shared_path
@@ -456,7 +456,7 @@ def _run_one_model(model, aw_shared_path=None):
             capture_output=True,
             text=True,
             timeout=180,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(MODELS_DIR),
             env=env,
         )
         if proc.returncode != 0:
