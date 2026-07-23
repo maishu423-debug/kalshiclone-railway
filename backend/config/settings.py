@@ -9,14 +9,34 @@ from kalshi_api.auth import load_local_env
 
 load_local_env(BASE_DIR)
 
-SECRET_KEY = "dev-only-kalshi-clone-secret-key"
-# Render sets RENDER=true on every deployed service automatically — no dashboard
-# config needed. Keeps DEBUG on for local dev, off for the live deployment so a
-# transient exception on any route returns a small error page instead of
-# Django's full HTML traceback (which is what tripped the cron monitor's
-# response-size limit on /ping/).
-DEBUG = not bool(os.environ.get("RENDER"))
-ALLOWED_HOSTS = ["localhost", "127.0.0.1","secondclone-67mh.onrender.com" ,".onrender.com", ".vercel.app"]
+
+def env_bool(name, default=False):
+    return os.environ.get(name, str(default)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+DEBUG = env_bool(
+    "DJANGO_DEBUG",
+    not bool(os.environ.get("RAILWAY_ENVIRONMENT_NAME")),
+)
+
+_dev_secret_key = "dev-only-kalshi-clone-secret-key"
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", _dev_secret_key)
+if not DEBUG and SECRET_KEY == _dev_secret_key:
+    raise RuntimeError("DJANGO_SECRET_KEY must be configured in production.")
+
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        "DJANGO_ALLOWED_HOSTS",
+        "localhost,127.0.0.1,.railway.app,.railway.internal,healthcheck.railway.app",
+    ).split(",")
+    if host.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
@@ -36,7 +56,10 @@ WSGI_APPLICATION = "config.wsgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": os.environ.get("DATABASE_PATH", str(BASE_DIR / "db.sqlite3")),
+        "OPTIONS": {
+            "timeout": 20,
+        },
     }
 }
 

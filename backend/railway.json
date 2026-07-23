@@ -1,0 +1,10 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "python manage.py migrate && gunicorn config.wsgi:application --bind [::]:${PORT:-8000} --workers 1 --threads 8 --timeout 0 --access-logfile -",
+    "healthcheckPath": "/api/kalshi/health/",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
