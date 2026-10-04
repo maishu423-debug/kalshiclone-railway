@@ -960,8 +960,6 @@ h1 {
 
 /* Second temp badge (daily high) */
 .algo-temp--high { color: #c47c00; font-weight: 700; }
-.algo-temp--obs { font-size: 0.8em; font-weight: 400; opacity: 0.85; }
-.algo-temp--stale { color: #c47c00; opacity: 1; font-weight: 600; }
 
 /* Momentum badge replacing EV badge */
 .ev-badge.yes { background: #d1f0e5; color: #0b6b4a; }

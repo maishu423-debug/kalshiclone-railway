@@ -1,7 +1,7 @@
 """
 Model-driven trading algorithm.
 
-ENSEMBLE:     Pair same-horizon models (O1+V1, O2+V2, O3+V3) with
+ENSEMBLE:     Pair same-horizon models (A1+V1, A2+V2, A3+V3) with
               weighted averages, then combine into a daily-high PDF.
 EACH CYCLE:   Find the live bracket containing the ensemble mean forecast
               ("current bracket"). Buy NO on every live bracket below it
@@ -26,12 +26,12 @@ CUTOFF_LOCAL_HOUR = 16
 NO_LADDER_CAP_MARGIN_F = 0.1
 
 # Weighted combination within each horizon pair.
-# OU and VAR(1) models (both ASOS-driven) are paired by forecast horizon.
+# AccuWeather and Variable-combined models are paired by forecast horizon.
 # Weights can be tuned from backtesting results.
 HORIZON_WEIGHTS = {
-    "1h": {"ou_1h": 0.5788, "var_1h": 0.4212},
-    "2h": {"ou_2h": 0.5744, "var_2h": 0.4256},
-    "3h": {"ou_3h": 0.5643, "var_3h": 0.4357},
+    "1h": {"accuweather_1h": 0.5788, "var_1h": 0.4212},
+    "2h": {"accuweather_2h": 0.5744, "var_2h": 0.4256},
+    "3h": {"accuweather_3h": 0.5643, "var_3h": 0.4357},
 }
 
 
@@ -41,11 +41,9 @@ def hours_to_cutoff() -> float:
     return max(0.0, CUTOFF_LOCAL_HOUR - local_h)
 
 
-def _nws_known_high_f(current_f, daily_high_f) -> int | None:
-    """Known high in whole F.  The recorded (NWS full-precision) high wins; the HFMETAR
-    current reading (whole-C, can overshoot by ~0.7 F) is only a fallback when no high exists."""
-    value = daily_high_f if daily_high_f is not None else current_f
-    return None if value is None else nws_round_temp_f(value)
+def _nws_known_high_f(*values) -> int | None:
+    rounded = [nws_round_temp_f(v) for v in values if v is not None]
+    return max(rounded) if rounded else None
 
 
 # ── Step 1: same-horizon ensemble PDFs ───────────────────────────────────────
@@ -365,56 +363,23 @@ def get_ensemble_forecast(results=None) -> dict:
 
 # ── Master state ──────────────────────────────────────────────────────────────
 
-def _observation_info():
-    """Observation timestamp/age/status (distinct from when the API last polled)."""
-    from datetime import datetime as _dt
-    from weather.asos_nowcast import freshness_status
-    from weather.asos_parser import parse_utc
-    from .temp_monitor import get_latest_observation
-
-    obs = get_latest_observation()
-    if not obs or not obs.get("observed_at"):
-        return {"observed_at": None, "observation_age_seconds": None,
-                "observation_status": "unavailable", "last_checked_at": None,
-                "source_status": None}
-    age = max(0.0, (_dt.now(timezone.utc) - parse_utc(obs["observed_at"])).total_seconds())
-    return {"observed_at": obs["observed_at"], "observation_age_seconds": round(age, 1),
-            "observation_status": freshness_status(age), "last_checked_at": obs.get("checked_at"),
-            "source_status": obs.get("source_status")}
-
-
-def _weather_summary(md):
-    """Provenance/freshness of the weather input, for the API/UI."""
-    if not md:
-        return None
-    return {
-        "weather_source":          md.get("weather_source"),
-        "station":                 md.get("station"),
-        "observation_time":        md.get("latest_observation_at"),
-        "observation_age_seconds": md.get("latest_observation_age_seconds"),
-        "status":                  md.get("status"),
-        "forecast_input_mode":     md.get("forecast_input_mode"),
-    }
-
-
 def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict:
     cache       = get_forecast_cache()
     all_results = cache.get("results", {})
     cutoff_h    = hours_to_cutoff()
-    nws_temp    = get_temp_snapshot()   # latest KMIA HFMETAR reading — display copy
+    nws_temp    = get_temp_snapshot()   # pure NWS — used for display only
     temp        = dict(nws_temp)        # algorithm copy, augmented below with model T0s
 
-    if temp.get("daily_high_f") is None:
-        # No NWS recorded high yet: fall back to the models' HFMETAR T0 as a lower bound.
-        model_t0s = []
-        for data in all_results.values():
-            if isinstance(data, dict) and "error" not in data and data.get("T0") is not None:
-                try:
-                    model_t0s.append(float(data["T0"]))
-                except (TypeError, ValueError):
-                    pass
-        if model_t0s:
-            temp = {**temp, "daily_high_f": max(model_t0s)}  # augmented for algorithm only
+    model_t0s = []
+    for data in all_results.values():
+        if isinstance(data, dict) and "error" not in data and data.get("T0") is not None:
+            try:
+                model_t0s.append(float(data["T0"]))
+            except (TypeError, ValueError):
+                pass
+    if model_t0s:
+        observed_high = max([temp.get("daily_high_f") or 0.0, *model_t0s])
+        temp = {**temp, "daily_high_f": observed_high}  # augmented for algorithm only
 
     # Filter to enabled models for recommendation and ensemble
     results = (
@@ -423,7 +388,8 @@ def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict
         else all_results
     )
 
-    # current_f comes from the latest fresh KMIA ASOS observation (temp monitor + forecast cycle).
+    # current_f is set by AccuWeather (every 15 min in _do_refresh, or on manual refresh).
+    # NWS ASOS only advances daily_high_f — never sets current_f (Celsius-rounding issue).
     # Do not call update_temp() here — model T0s are already folded in via model_t0s above.
 
     analyses       = analyze_markets(markets)
@@ -467,12 +433,10 @@ def get_full_state(markets: list, paper_state=None, enabled_models=None) -> dict
             "last_run_at": cache.get("last_run_at"),
             "running":     cache.get("running", False),
             "loop":        cache.get("loop"),
-            "weather":     _weather_summary(cache.get("weather")),
         },
         "temp": {
             "current_f":    round(nws_temp["current_f"],    1) if nws_temp["current_f"]    is not None else None,
             "daily_high_f": nws_round_temp_f(nws_temp["daily_high_f"]) if nws_temp["daily_high_f"] is not None else None,
-            **_observation_info(),
         },
         "analysis":       analyses,
         "recommendation": recommendation,

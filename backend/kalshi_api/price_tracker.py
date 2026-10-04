@@ -69,14 +69,11 @@ def update_temp(temp_f: float):
 
 def update_current(temp_f: float):
     """Update current temperature without changing daily_high."""
-    global _current_f, _daily_high_f, _date_str
+    global _current_f, _date_str
     if temp_f is None:
         return
     with _lock:
-        today = _today_key()
-        if _date_str != today:
-            _date_str = today
-            _daily_high_f = None     # new day: don't carry yesterday's high
+        _date_str = _today_key()
         _current_f = temp_f
 
 

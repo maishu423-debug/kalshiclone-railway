@@ -247,7 +247,7 @@ def algorithm_trade(request):
     is close enough to its cap) and every live bracket below it.
 
     Body (JSON, optional):
-      { "dollars_cents": 1000, "enabled_models": ["ou_1h", ...] }
+      { "dollars_cents": 1000, "enabled_models": ["accuweather_1h", ...] }
     """
     try:
         body = json.loads(request.body.decode()) if request.body else {}
@@ -350,16 +350,9 @@ def algorithm_cron_refresh(request):
 @require_POST
 def algorithm_refresh_temp(_request):
     """Immediately fetch the latest weather reading and return updated temp."""
-    asos = refresh_temp_now(reuse_seconds=30)      # manual button: don't hammer NOAA
+    asos = refresh_temp_now()
     if asos is None:
-        return JsonResponse({"error": "weather_unavailable",
-                             "message": "No KMIA observation available from NOAA MADIS HFMETAR."}, status=502)
-    if asos.get("status") == "unavailable":
-        return JsonResponse({"error": "weather_unavailable",
-                             "message": "Latest KMIA HFMETAR observation is too old to treat as current.",
-                             "observed_at": asos.get("observed_at"),
-                             "observation_age_seconds": asos.get("age_seconds"),
-                             "last_checked_at": asos.get("checked_at")}, status=503)
+        return JsonResponse({"error": "Temperature refresh failed."}, status=502)
     high_f = asos.get("today_high_f")
     if high_f is None:
         high_f = asos.get("t0_f")
@@ -367,15 +360,4 @@ def algorithm_refresh_temp(_request):
         "current_f":    round(float(asos["t0_f"]), 1),
         "daily_high_f": nws_round_temp_f(high_f),
         "observed_at":  asos.get("observed_at"),
-        "observation_age_seconds": asos.get("age_seconds"),
-        "observation_status":      asos.get("status"),
-        "last_checked_at":         asos.get("checked_at"),
-        "source_status":           asos.get("source_status"),
     })
-
-
-@require_GET
-def weather_diagnostics(_request):
-    """Temporary diagnostics: proves what the live KMIA HFMETAR feed is delivering."""
-    from weather.asos_client import diagnostics
-    return JsonResponse(diagnostics())

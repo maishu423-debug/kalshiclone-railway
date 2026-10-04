@@ -142,15 +142,7 @@ type AlgorithmState = {
     last_run_at: string | null;
     running:     boolean;
   };
-  temp:           {
-    current_f: number | null;
-    daily_high_f: number | null;
-    observed_at?: string | null;               // ASOS observation time (UTC ISO)
-    observation_age_seconds?: number | null;
-    observation_status?: "healthy" | "delayed" | "unavailable";
-    last_checked_at?: string | null;           // when the server last polled MADIS
-    source_status?: string | null;             // "ok" | "fetch_error_using_last_good" | ...
-  };
+  temp:           { current_f: number | null; daily_high_f: number | null };
   analysis:       MarketMomentum[];
   recommendation: Recommendation;
   time_to_cutoff: { hours: number; display: string };
@@ -203,24 +195,11 @@ function evColor(ev: number | null | undefined) {
   return "ev-neg";
 }
 
-function observationLabel(t: { observed_at?: string | null; observation_age_seconds?: number | null; observation_status?: string; source_status?: string | null } | undefined) {
-  if (!t?.observed_at) return "ASOS observation: unavailable";
-  const when = new Date(t.observed_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  const age = t.observation_age_seconds;
-  const mins = age === null || age === undefined ? null : Math.round(age / 60);
-  let text = `ASOS observation: ${when}`;
-  if (mins !== null) text += ` · ${mins} min old`;
-  if (t.observation_status === "delayed") text += " · DELAYED";
-  if (t.observation_status === "unavailable") text += " · UNAVAILABLE";
-  if (t.source_status === "fetch_error_using_last_good") text += " · MADIS check temporarily failed";
-  return text;
-}
-
 function modelLabel(key: string) {
   const map: Record<string, string> = {
-    ou_1h:          "OU (ASOS) +1h",
-    ou_2h:          "OU (ASOS) +2h",
-    ou_3h:          "OU (ASOS) +3h",
+    accuweather_1h: "AccuWeather +1h",
+    accuweather_2h: "AccuWeather +2h",
+    accuweather_3h: "AccuWeather +3h",
     var_1h:         "VAR(1) +1h",
     var_2h:         "VAR(1) +2h",
     var_3h:         "VAR(1) +3h",
@@ -432,10 +411,10 @@ export default function Home() {
   autoTradeRef.current = autoTradeEnabled;
 
   // Model enable/disable switches
-  const ALL_MODELS = ["ou_1h", "ou_2h", "ou_3h", "var_1h", "var_2h", "var_3h"] as const;
+  const ALL_MODELS = ["accuweather_1h", "accuweather_2h", "accuweather_3h", "var_1h", "var_2h", "var_3h"] as const;
   type ModelKey = typeof ALL_MODELS[number];
   const [enabledModels, setEnabledModels]       = useState<Record<ModelKey, boolean>>({
-    ou_1h: true, ou_2h: true, ou_3h: true,
+    accuweather_1h: true, accuweather_2h: true, accuweather_3h: true,
     var_1h: true,         var_2h: true,         var_3h: true,
   });
   const enabledModelsRef = useRef(enabledModels);
@@ -821,8 +800,8 @@ export default function Home() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `Temperature refresh failed (${res.status})`);
       await loadAlgoState();
-      const checked = data.last_checked_at ? new Date(data.last_checked_at).toLocaleTimeString() : "just now";
-      setAlgoMessage(`${observationLabel(data)} · Last checked: ${checked} — now ${data.current_f}°F, high ${data.daily_high_f}°F.`);
+      const observed = data.observed_at ? ` (${new Date(data.observed_at).toLocaleTimeString()})` : "";
+      setAlgoMessage(`Temperature refreshed${observed}: now ${data.current_f}°F, high ${data.daily_high_f}°F.`);
     } catch (err) {
       setAlgoError(err instanceof Error ? err.message : "Temperature refresh failed.");
     } finally {
@@ -903,14 +882,6 @@ export default function Home() {
             {tempNow !== null && tempNow !== undefined && (
               <span className="algo-temp">Current Temp: {tempNow.toFixed(1)}°F</span>
             )}
-            {algoState?.temp && (
-              <span className={`algo-temp algo-temp--obs ${algoState.temp.observation_status === "healthy" ? "" : "algo-temp--stale"}`}>
-                {observationLabel(algoState.temp)}
-                {algoState.temp.last_checked_at
-                  ? ` · Last checked: ${new Date(algoState.temp.last_checked_at).toLocaleTimeString()}`
-                  : ""}
-              </span>
-            )}
             {tempHigh !== null && tempHigh !== undefined && (
               <span className="algo-temp algo-temp--high">Recorded High: {tempHigh}°F</span>
             )}
@@ -918,7 +889,7 @@ export default function Home() {
               className="algo-btn algo-btn--temp-refresh"
               onClick={refreshTemp}
               disabled={isRefreshingTemp}
-              title="Poll NOAA MADIS HFMETAR for the latest KMIA ASOS observation"
+              title="Fetch latest temperature from NWS ASOS"
             >
               {isRefreshingTemp ? "…" : "⟳"}
             </button>

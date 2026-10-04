@@ -1,108 +1,312 @@
-"""
-Fast KMIA current-temperature / recorded-high monitor (NOAA MADIS OMO/HFMETAR only).
-
-Polls the MADIS HFMETAR client every minute (polling cadence), but the selected
-observation only changes when MADIS publishes a newer observation timestamp.  Current temperature is only pushed
-to the tracker when the latest ASOS observation is fresh enough
-(weather.config.ASOS_MAX_CURRENT_AGE_MINUTES); a stale feed is reported as
-unavailable instead of being presented as current.
-"""
-import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-from weather import config as wcfg
-from weather.asos_client import fetch_recent_observations, log_refresh
-from weather.asos_nowcast import STATUS_UNAVAILABLE, freshness_status
-from weather.asos_parser import parse_utc
-from weather.nws_high import get_recorded_high
-
-log = logging.getLogger("temp-monitor")
+import requests
 
 
-
-def seconds_until_next_slot(now=None):
-    """Seconds until the next poll slot (second 0 of each POLL_EVERY_MINUTES-th minute;
-    with a 5-minute step: HH:01, :06, :11, ...)."""
-    now = now or datetime.now(timezone.utc)
-    step = wcfg.POLL_EVERY_MINUTES
-    minutes_into_cycle = (now.minute - wcfg.POLL_MINUTE_OFFSET) % step
-    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=step - minutes_into_cycle)
-    if minutes_into_cycle == 0 and now.second == 0 and now.microsecond == 0:
-        nxt = now
-    return max(0.0, (nxt - now).total_seconds())
+SYNOPTIC_TOKEN = (
+    os.getenv("SYNOPTIC_TOKEN")
+    or os.getenv("SYNOPTIC_API_TOKEN")
+    or ""
+).strip()
+SYNOPTIC_STATION = os.getenv("SYNOPTIC_STATION", "KMIA").strip() or "KMIA"
+SYNOPTIC_BASE = "https://api.synopticdata.com/v2/stations/timeseries"
+POLL_INTERVAL = 60
 
 _lock = threading.Lock()
 _started = False
 _latest = None
 
 
-def fetch_current_high(now=None, reuse_seconds=0):
-    """
-    Returns {"t0_f", "today_high_f", "observed_at", "age_seconds", "status", "source"}
-    or None when no ASOS observation could be fetched at all.
-    today_high_f = max full-precision (tenths of C) KMIA observation since Miami-local midnight,
-    from the NWS observations feed, or None if unavailable.  HFMETAR (whole C) feeds t0_f only.
-    """
-    now = now or datetime.now(timezone.utc)
+def _metar_temp_f(row: dict):
     try:
-        observations, info = fetch_recent_observations(now=now, reuse_seconds=reuse_seconds)
-        log_refresh(observations, info, now, debug=os.getenv("ASOS_DEBUG", "").lower() in {"1", "true", "yes"})
-    except Exception as exc:                       # never let a poll problem erase the last good obs
-        log.exception("MADIS poll crashed; keeping last good observation")
-        observations, info = [], {"errors": [f"poll crashed: {exc}"], "source_status": "fetch_error_using_last_good"}
-    if not observations:
-        prev = get_latest_observation()
-        if prev and prev.get("observed_at"):      # keep serving the last good one, with its real age
-            age = max(0.0, (now - parse_utc(prev["observed_at"])).total_seconds())
-            return {**prev, "age_seconds": round(age, 1), "status": freshness_status(age),
-                    "checked_at": now.isoformat(), "source_status": "fetch_error_using_last_good",
-                    "last_poll_success": False}
-        log.warning("no KMIA observation available and none held: %s", info.get("errors"))
+        temp_c = row.get("temp")
+        if temp_c is None:
+            return None
+        return float(temp_c) * 9 / 5 + 32
+    except (TypeError, ValueError):
         return None
-    latest = observations[-1]
-    age = max(0.0, (now - parse_utc(latest["observed_at"])).total_seconds())
-    high = get_recorded_high(now)       # full-precision NWS obs, never the whole-C HFMETAR max
+
+
+def _metar_observed_at(row: dict):
+    raw = row.get("obsTime") or row.get("receiptTime") or row.get("reportTime")
+    if isinstance(raw, (int, float)):
+        ts = float(raw) / 1000 if raw > 10_000_000_000 else float(raw)
+        return datetime.utcfromtimestamp(ts).isoformat() + "Z"
+    return raw
+
+
+def _first_observation_array(observations: dict, prefix: str):
+    for key, values in observations.items():
+        if key.startswith(prefix) and isinstance(values, list):
+            return values
+    return None
+
+
+def _fetch_synoptic_current_high():
+    if not SYNOPTIC_TOKEN:
+        return None
+
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    miami_tz = ZoneInfo("America/New_York")
+    now_utc = datetime.now(timezone.utc)
+    midnight_miami = now_utc.astimezone(miami_tz).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start_utc = midnight_miami.astimezone(timezone.utc).strftime("%Y%m%d%H%M")
+    end_utc = now_utc.strftime("%Y%m%d%H%M")
+
+    params = {
+        "stid": SYNOPTIC_STATION,
+        "start": start_utc,
+        "end": end_utc,
+        "vars": "air_temp",
+        "units": "temp|F,speed|mph,english",
+        "obtimezone": "local",
+        "complete": "1",
+        "showemptystations": "1",
+        "hfmetars": "1",
+        "token": SYNOPTIC_TOKEN,
+    }
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "kalshi-trading-bot/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    try:
+        resp = requests.get(SYNOPTIC_BASE, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        stations = resp.json().get("STATION") or []
+        if not stations:
+            return None
+
+        observations = (stations[0] or {}).get("OBSERVATIONS") or {}
+        times = observations.get("date_time") or []
+        temps = _first_observation_array(observations, "air_temp_set_")
+        if not times or not temps:
+            return None
+
+        current = None
+        observed_high = None
+        for i, temp in enumerate(temps):
+            if temp is None:
+                continue
+            try:
+                temp_f = float(temp)
+            except (TypeError, ValueError):
+                continue
+            current = {
+                "t0_f": temp_f,
+                "observed_at": times[i] if i < len(times) else None,
+            }
+            observed_high = temp_f if observed_high is None else max(observed_high, temp_f)
+
+        if current is None:
+            return None
+        return {
+            "t0_f": current["t0_f"],
+            "today_high_f": observed_high,
+            "observed_at": current["observed_at"],
+            "source": "synoptic",
+        }
+    except Exception as exc:
+        print(f"[temp-monitor] Synoptic KMIA fetch failed ({exc}); falling back to AviationWeather/NWS")
+        return None
+
+
+def _fetch_aviation_metar_current():
+    url = "https://aviationweather.gov/api/data/metar"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "kalshi-trading-bot/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    try:
+        resp = requests.get(
+            url,
+            params={"ids": "KMIA", "format": "json", "hours": 24, "_": int(time.time())},
+            headers=headers,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not isinstance(rows, list):
+            return None
+
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+
+        miami_tz = ZoneInfo("America/New_York")
+        today_miami = datetime.now(timezone.utc).astimezone(miami_tz).date()
+        valid = []
+        for row in rows:
+            temp_f = _metar_temp_f(row)
+            if temp_f is None:
+                continue
+            observed_at = _metar_observed_at(row)
+            if observed_at:
+                try:
+                    obs_dt = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+                    if obs_dt.astimezone(miami_tz).date() != today_miami:
+                        continue
+                except Exception:
+                    pass
+            valid.append({"temp_f": temp_f, "observed_at": observed_at})
+
+        if not valid:
+            return None
+        valid.sort(key=lambda row: row.get("observed_at") or "", reverse=True)
+        return {
+            "t0_f": valid[0]["temp_f"],
+            "today_high_f": max(row["temp_f"] for row in valid),
+            "observed_at": valid[0].get("observed_at"),
+            "source": "aviationweather",
+        }
+    except Exception as exc:
+        print(f"[temp-monitor] AviationWeather METAR fetch failed ({exc}); falling back to NWS")
+        return None
+
+
+def _fetch_nws_latest():
+    headers = {
+        "Accept": "application/geo+json",
+        "User-Agent": "kalshi-trading-bot/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    try:
+        resp = requests.get(
+            "https://api.weather.gov/stations/KMIA/observations/latest",
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        props = resp.json().get("properties", {})
+        temp_c = (props.get("temperature") or {}).get("value")
+        if temp_c is None:
+            return None
+        return {
+            "t0_f": float(temp_c) * 9 / 5 + 32,
+            "observed_at": props.get("timestamp"),
+            "source": "nws_latest",
+        }
+    except Exception as exc:
+        print(f"[temp-monitor] NWS /observations/latest failed ({exc})")
+        return None
+
+
+def fetch_current_high():
+    synoptic = _fetch_synoptic_current_high()
+    if synoptic is not None:
+        return synoptic
+
+    metar = _fetch_aviation_metar_current()
+    nws_latest = _fetch_nws_latest()
+
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    miami_tz = ZoneInfo("America/New_York")
+    now_utc = datetime.now(timezone.utc)
+    midnight_miami = now_utc.astimezone(miami_tz).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start_utc = midnight_miami.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    headers = {
+        "Accept": "application/geo+json",
+        "User-Agent": "kalshi-trading-bot/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    nws_list_high = None
+    nws_list_t0 = None
+    nws_list_obs = None
+    try:
+        resp = requests.get(
+            "https://api.weather.gov/stations/KMIA/observations",
+            params={"start": start_utc, "limit": 500},
+            headers=headers,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        features = sorted(
+            resp.json().get("features", []),
+            key=lambda feat: (feat.get("properties", {}) or {}).get("timestamp") or "",
+            reverse=True,
+        )
+        temps = []
+        for feat in features:
+            props = feat.get("properties", {})
+            temp_c = (props.get("temperature") or {}).get("value")
+            if nws_list_obs is None and temp_c is not None:
+                nws_list_obs = props.get("timestamp")
+            if temp_c is None:
+                continue
+            try:
+                temps.append(float(temp_c) * 9 / 5 + 32)
+            except (TypeError, ValueError):
+                pass
+        if temps:
+            nws_list_high = max(temps)
+            nws_list_t0 = temps[0]
+    except Exception as exc:
+        print(f"[temp-monitor] NWS observations list failed ({exc})")
+
+    t0_f = (
+        metar.get("t0_f") if metar
+        else nws_latest["t0_f"] if nws_latest
+        else nws_list_t0
+    )
+    observed_at = (
+        (metar or {}).get("observed_at")
+        or (nws_latest or {}).get("observed_at")
+        or nws_list_obs
+    )
+    high_candidates = [
+        v for v in (
+            nws_list_high,
+            metar.get("today_high_f") if metar else None,
+            nws_latest["t0_f"] if nws_latest else None,
+        )
+        if v is not None
+    ]
+
+    if t0_f is None and not high_candidates:
+        return None
+
     return {
-        "t0_f": latest["temp_f"],
-        "today_high_f": high["high_f"] if high else None,
-        "observed_at": latest["observed_at"],
-        "age_seconds": round(age, 1),
-        "status": freshness_status(age),
-        "source": wcfg.SOURCE_ID,
-        "checked_at": now.isoformat(),
-        "source_status": info.get("source_status", "ok"),
-        "last_poll_success": info.get("last_poll_success", not info.get("errors")),
+        "t0_f": t0_f,
+        "today_high_f": max(high_candidates) if high_candidates else t0_f,
+        "observed_at": observed_at,
+        "source": "fallback",
     }
 
 
 def apply_current_high(observation: dict):
     if not observation:
         return
-    global _latest
     with _lock:
-        prev = _latest
-        # Never move the selected observation backwards in time.
-        if prev and prev.get("observed_at") and observation.get("observed_at")                 and parse_utc(observation["observed_at"]) < parse_utc(prev["observed_at"]):
-            observation = {**prev, "checked_at": observation.get("checked_at"),
-                           "age_seconds": prev.get("age_seconds")}
+        global _latest
         _latest = dict(observation)
 
-    from .price_tracker import set_daily_high_nws, update_current
+    from .price_tracker import set_daily_high_nws, update_temp
 
-    # Today's high is a record of what happened, so it is safe to advance even when
-    # the feed is delayed.  Current temperature is only updated from a usable obs,
-    # and never advances the recorded high (HFMETAR whole-C can overshoot it).
-    if observation.get("status") != STATUS_UNAVAILABLE and observation.get("t0_f") is not None:
-        update_current(float(observation["t0_f"]))
+    if observation.get("t0_f") is not None:
+        update_temp(float(observation["t0_f"]))
     if observation.get("today_high_f") is not None:
         set_daily_high_nws(float(observation["today_high_f"]))
 
 
-def refresh_temp_now(reuse_seconds=0):
-    observation = fetch_current_high(reuse_seconds=reuse_seconds)
+def refresh_temp_now():
+    observation = fetch_current_high()
     if observation is None:
         return None
     apply_current_high(observation)
@@ -113,11 +317,7 @@ def refresh_temp_now(reuse_seconds=0):
         "t0_f": snap["current_f"],
         "today_high_f": snap["daily_high_f"],
         "observed_at": observation.get("observed_at"),
-        "age_seconds": observation.get("age_seconds"),
-        "status": observation.get("status"),
         "source": observation.get("source"),
-        "checked_at": observation.get("checked_at"),
-        "source_status": observation.get("source_status"),
     }
 
 
@@ -127,24 +327,13 @@ def get_latest_observation():
 
 
 def _poll_loop():
-    """Poll NOAA every MADIS_POLL_MINUTES (default 1) so a newly published observation is picked up fast."""
-    try:
-        refresh_temp_now()                        # prime the display at startup
-    except Exception as exc:
-        log.warning("startup poll error: %s", exc)
+    time.sleep(10)
     while True:
-        time.sleep(seconds_until_next_slot() or 1.0)
         try:
-            result = refresh_temp_now()
-            # with sparse polling (>1 min) retry once if that poll failed or the observation is unusably old
-            failed = (result is None or result.get("source_status") != "ok"
-                      or result.get("status") == "unavailable")
-            if wcfg.POLL_EVERY_MINUTES > 1 and failed:
-                time.sleep(wcfg.POLL_RETRY_SECONDS)
-                refresh_temp_now()
+            refresh_temp_now()
         except Exception as exc:
-            log.warning("poll error: %s", exc)
-        time.sleep(1.0)                          # never re-fire inside the same slot
+            print(f"[temp-monitor] poll error: {exc}")
+        time.sleep(POLL_INTERVAL)
 
 
 def start_temp_monitor():

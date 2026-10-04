@@ -23,4 +23,3 @@ live_trader/**/*.sqlite3
 live_trader/trade_state.json
 
 .claude/settings.local.json
-backend/modelscripts/asos_last_good.json
