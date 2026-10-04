@@ -26,6 +26,7 @@ urlpatterns = [
     path("algorithm/cron-refresh/",   views.algorithm_cron_refresh),
     path("algorithm/refresh-temp",    views.algorithm_refresh_temp),
     path("algorithm/refresh-temp/",   views.algorithm_refresh_temp),
+    path("weather/diagnostics/",      views.weather_diagnostics),
     path("algorithm/forecast-history",  views.forecast_history),
     path("algorithm/forecast-history/", views.forecast_history),
     path("algorithm/trade-history",     views.trade_history),

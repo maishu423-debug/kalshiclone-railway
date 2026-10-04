@@ -7,3 +7,4 @@ numpy==2.4.6
 pandas==3.0.3
 requests==2.34.2
 websockets==16.0
+scipy==1.18.0

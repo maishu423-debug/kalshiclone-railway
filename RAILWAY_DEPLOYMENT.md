@@ -44,13 +44,12 @@ RUN_BACKGROUND_TASKS=true
 TZ=UTC
 ```
 
-Weather integrations:
+Weather: no API keys. Observations come from NOAA ASOS (KMIA, ~5-minute
+cadence); see `backend/README.md`. Optional:
 
 ```env
-ACCUWEATHER_API_KEY=
-SYNOPTIC_TOKEN=
-SYNOPTIC_STATION=KMIA
 CRON_REFRESH_SECRET=
+ASOS_STATION=KMIA
 ```
 
 Optional authenticated Kalshi WebSocket access:
