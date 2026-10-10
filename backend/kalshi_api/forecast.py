@@ -1,7 +1,7 @@
 """
 Background forecast runner.
 
-Spawns all 6 ML model scripts as subprocesses in parallel every 15 minutes,
+Spawns all 6 ML model scripts as subprocesses in parallel every FORECAST_REFRESH_SECONDS (default 5 minutes),
 caches their JSON output in memory, and exposes helpers for the algorithm.
 """
 import json
@@ -27,7 +27,7 @@ MODELS = [
     {"name": "var_3h",         "script": "variable_combined_3hour.py"},
 ]
 
-REFRESH_INTERVAL = 900  # seconds (15 minutes)
+REFRESH_INTERVAL = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))  # seconds (default 5 minutes)
 STARTUP_DELAY = 30      # let lightweight /ping/ respond before CPU-heavy models start
 
 _lock = threading.Lock()
